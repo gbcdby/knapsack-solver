@@ -4405,6 +4405,8 @@ function init() {
 		[els.selectedTableEl, els.selectedBonusToggle, "show-bonus"],
 		[els.selectedTableEl, els.selectedQuantityToggle, "show-quantity"],
 	].forEach(([table, toggle, cls]) => {
+		// 初始状态同步：勾选（如默认开启的"添加数量"）则显示对应列
+		table.classList.toggle(cls, toggle.checked);
 		toggle.addEventListener("change", () => {
 			table.classList.toggle(cls, toggle.checked);
 		});
