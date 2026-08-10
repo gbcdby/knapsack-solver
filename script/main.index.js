@@ -920,7 +920,7 @@ function engPrepare(snap) {
 				const minCell = Math.min.apply(null, cells);
 				if (!bm.has(minCell)) bm.set(minCell, []);
 				bm.get(minCell).push(list.length);
-				list.push({ r, c, cells, minCell });
+				list.push({ r, c, cells, minCell, pi: list.length });
 			}
 		}
 		placements.push(list);
@@ -963,27 +963,91 @@ function engAdjIds(ctx, occ, cells, self) {
 	return adj;
 }
 
+// 相邻实例收集（热路径零分配版）：scratch 复用戳数组去重，结果写入 scratch.list。
+// 单次收集用 engAdjInto；同一轮并集（如 move 的旧/新位置）用 engAdjBegin 开一轮后
+// 多次 engAdjCollect。嵌套规则：外层遍历某个 scratch 的 list 时，内层 engContrib
+// 必须用另一个 scratch（调用处约定外层 A、内层 B）。
+function engAdjScratch(n) {
+	return { stamp: new Int32Array(n), mark: 0, list: [] };
+}
+function engAdjBegin(scr) {
+	scr.mark++;
+	if (scr.mark >= 0x7fffffff) {
+		scr.stamp.fill(0);
+		scr.mark = 1;
+	}
+	scr.list.length = 0;
+}
+function engAdjCollect(ctx, occ, cells, self, scr) {
+	const st = scr.stamp;
+	const m = scr.mark;
+	const list = scr.list;
+	const cols = ctx.cols;
+	const rows = ctx.rows;
+	for (let x = 0; x < cells.length; x++) {
+		const ci = cells[x];
+		const r = (ci / cols) | 0;
+		const c = ci % cols;
+		if (r > 0) {
+			const v = occ[ci - cols];
+			if (v >= 0 && v !== self && st[v] !== m) {
+				st[v] = m;
+				list.push(v);
+			}
+		}
+		if (r < rows - 1) {
+			const v = occ[ci + cols];
+			if (v >= 0 && v !== self && st[v] !== m) {
+				st[v] = m;
+				list.push(v);
+			}
+		}
+		if (c > 0) {
+			const v = occ[ci - 1];
+			if (v >= 0 && v !== self && st[v] !== m) {
+				st[v] = m;
+				list.push(v);
+			}
+		}
+		if (c < cols - 1) {
+			const v = occ[ci + 1];
+			if (v >= 0 && v !== self && st[v] !== m) {
+				st[v] = m;
+				list.push(v);
+			}
+		}
+	}
+}
+function engAdjInto(ctx, occ, cells, self, scr) {
+	engAdjBegin(scr);
+	engAdjCollect(ctx, occ, cells, self, scr);
+}
+
 // 实例 i 的加权贡献（occ 中 >=0 的值为实例编号）
-function engContrib(ctx, occ, insts, i) {
+// scr 为相邻收集 scratch：这是退火最内层热函数（每次移动对每个受影响法宝调用），
+// 必须零分配——相邻列表复用 scr.list（戳数组去重），贡献用三个标量而不是数组，
+// 否则 GC 压力会拖垮迭代速度。调用方若正在遍历另一个 scratch 的 list，须传不同的 scr。
+function engContrib(ctx, occ, insts, i, scr) {
 	const p = ctx.items[insts[i].item];
-	const adj = engAdjIds(ctx, occ, insts[i].cells, i);
+	engAdjInto(ctx, occ, insts[i].cells, i, scr);
+	const list = scr.list;
 	let same = 0;
-	const recv = [0, 0, 0];
-	adj.forEach((j) => {
-		const q = ctx.items[insts[j].item];
-		if (q.ftype !== p.ftype) return;
+	let recv0 = 0;
+	let recv1 = 0;
+	let recv2 = 0;
+	for (let x = 0; x < list.length; x++) {
+		const q = ctx.items[insts[list[x]].item];
+		if (q.ftype !== p.ftype) continue;
 		same++;
-		recv[0] += q.adjPct[0];
-		recv[1] += q.adjPct[1];
-		recv[2] += q.adjPct[2];
-	});
+		recv0 += q.adjPct[0];
+		recv1 += q.adjPct[1];
+		recv2 += q.adjPct[2];
+	}
 	// 先算各属性原始最终值，再 Min-Max 标准化（× invMax 即 ÷ 理论极值），最后乘用户权重：
 	// 保持「先标准化（除法消除量纲）→ 再加权（表达设计意图）」两层结构，不合并成单层权重。
-	// 注意：这是退火最内层热函数（每次移动对每个受影响法宝调用），
-	// 必须零分配——用三个标量而不是数组，否则 GC 压力会拖垮迭代速度
-	const r0 = p.base[0] * (1 + p.selfPct[0] * same + recv[0]);
-	const r1 = p.base[1] * (1 + p.selfPct[1] * same + recv[1]);
-	const r2 = p.base[2] * (1 + p.selfPct[2] * same + recv[2]);
+	const r0 = p.base[0] * (1 + p.selfPct[0] * same + recv0);
+	const r1 = p.base[1] * (1 + p.selfPct[1] * same + recv1);
+	const r2 = p.base[2] * (1 + p.selfPct[2] * same + recv2);
 	return (
 		r0 * ctx.invMax[0] * ctx.weights[0] +
 		r1 * ctx.invMax[1] * ctx.weights[1] +
@@ -1067,6 +1131,7 @@ function engWorkerMain() {
 	let stopped = false;
 	let rand = Math.random;
 	let WID = 0;
+	let pendingAdopt = null; // 主线程岛模型迁移广播的全局最优（chunk 边界消费）
 
 	function rng32(seed) {
 		return function () {
@@ -1089,6 +1154,8 @@ function engWorkerMain() {
 			annealRun();
 		} else if (m.type === "stop") {
 			stopped = true;
+		} else if (m.type === "adopt") {
+			pendingAdopt = m;
 		}
 	};
 
@@ -1116,6 +1183,9 @@ function engWorkerMain() {
 		let lnsAttempts = 0; // LNS 实际执行的修复次数（缓存命中跳过不计）
 		let lastRepair = 0;
 		let lastImproveAt = 0; // 全局最优最近一次刷新的时刻，LNS 只在平台期触发
+		let lnsK = 2; // 自适应摧毁规模：连续 3 次修复无改进 +1（封顶 10），有改进回落 2
+		let lnsFailStreak = 0;
+		let lastAdoptAt = 0; // 最近一次采纳全局最优的时刻（迁移节流，保护多样性）
 		const repairFailCache = new Set(); // 无改进的摧毁组合缓存（键含 bestScore，best 一变自动失效）
 
 		// 混合模式：LNS（周期性摧毁 + 小规模精确修复）
@@ -1126,8 +1196,8 @@ function engWorkerMain() {
 		// 单格件在叶子贪心补位；LP 面积帽 + 连通空区两级上界剪枝；
 		// 无改进的摧毁组合进失败缓存，避免同 best 下重复空跑。
 		const LNS_PERIOD = 3000;
-		const LNS_REPAIR_MS = 300;
-		const LNS_REPAIR_NODES = 300000;
+		const LNS_REPAIR_MS = 500;
+		const LNS_REPAIR_NODES = 500000;
 		// 每件法宝的贡献上界：基础 × (1 + (自身加成 + 同五行相邻加成总和) × 周长)，
 		// 再按「先标准化 → 再加权」折算（两种模式的 fillW 都由此推导，因此都算）
 		const maxC = items.map((p) => {
@@ -1172,40 +1242,67 @@ function engWorkerMain() {
 						.sort((a, b) => maxC[b] / items[b].area - maxC[a] / items[a].area)
 				: null;
 
-		// 尝试摆放：占用合法则临时放上并返回增量信息，否则返回 null
+		// 热路径复用结构：scrA 外层影响集合遍历 / scrB engContrib 内层（两者并行遍历不冲突）；
+		// aff 为扁平的贡献重算结果缓冲（ids/vals 定长数组），res 为各移动类型的共享返回对象。
+		// try* 返回的 res 是复用对象，下一次同类 try 即失效——调用方须立即 apply/undo
+		// 或只读取标量（delta），不得留存对象引用。
+		const scrA = engAdjScratch(n);
+		const scrB = engAdjScratch(n);
+		const maxAff =
+			items.reduce((m, p) => Math.max(m, p.per), 0) + 2; // 相邻上限 + 自身 + 余量
+		const mkAff = () => ({
+			ids: new Int32Array(maxAff),
+			vals: new Float64Array(maxAff),
+			n: 0,
+		});
+		const placeRes = { delta: 0, cells: null, aff: mkAff() };
+		const removeRes = { delta: 0, cells: null, pr: null, aff: mkAff() };
+		const moveRes = {
+			delta: 0,
+			oldCells: null,
+			newCells: null,
+			prOld: null,
+			aff: mkAff(),
+		};
+
+		// 尝试摆放：占用合法则临时放上并把增量信息写入共享的 placeRes，否则返回 null
 		function tryPlace(u, ui, pr) {
 			const cells = pr.cells;
 			for (let i = 0; i < cells.length; i++) {
 				if (occ[cells[i]] !== -1) return null;
 			}
-			const aff = engAdjIds(ctx, occ, cells, ui);
-			aff.add(ui);
-			let oldSum = 0;
-			aff.forEach((a) => {
-				oldSum += units[a].contrib;
-			});
-			cells.forEach((ci) => {
-				occ[ci] = ui;
-			});
+			engAdjInto(ctx, occ, cells, ui, scrA);
+			const adjList = scrA.list;
+			const adjN = adjList.length;
+			let oldSum = u.contrib;
+			for (let i = 0; i < adjN; i++) oldSum += units[adjList[i]].contrib;
+			for (let i = 0; i < cells.length; i++) occ[cells[i]] = ui;
 			u.cells = cells;
 			u.pr = pr;
 			let newSum = 0;
-			const newC = [];
-			aff.forEach((a) => {
-				const c = engContrib(ctx, occ, units, a);
-				newC.push([a, c]);
-				newSum += c;
-			});
-			return {
-				delta: newSum - oldSum + cells.length * fillW,
-				cells,
-				newC,
-			};
+			const aff = placeRes.aff;
+			aff.n = 0;
+			for (let i = 0; i < adjN; i++) {
+				const a = adjList[i];
+				const cv = engContrib(ctx, occ, units, a, scrB);
+				aff.ids[aff.n] = a;
+				aff.vals[aff.n] = cv;
+				aff.n++;
+				newSum += cv;
+			}
+			const cu = engContrib(ctx, occ, units, ui, scrB);
+			aff.ids[aff.n] = ui;
+			aff.vals[aff.n] = cu;
+			aff.n++;
+			newSum += cu;
+			placeRes.delta = newSum - oldSum + cells.length * fillW;
+			placeRes.cells = cells;
+			return placeRes;
 		}
 		function applyPlace(u, res) {
-			res.newC.forEach(([a, c]) => {
-				units[a].contrib = c;
-			});
+			for (let i = 0; i < res.aff.n; i++) {
+				units[res.aff.ids[i]].contrib = res.aff.vals[i];
+			}
 			score += res.delta;
 		}
 		function undoPlace(u, res) {
@@ -1216,37 +1313,40 @@ function engWorkerMain() {
 			u.pr = null;
 		}
 		function tryRemove(u, ui) {
-			const aff = engAdjIds(ctx, occ, u.cells, ui);
-			aff.add(ui);
-			let oldSum = 0;
-			aff.forEach((a) => {
-				oldSum += units[a].contrib;
-			});
+			engAdjInto(ctx, occ, u.cells, ui, scrA);
+			const adjList = scrA.list;
+			const adjN = adjList.length;
+			let oldSum = u.contrib;
+			for (let i = 0; i < adjN; i++) oldSum += units[adjList[i]].contrib;
 			const cells = u.cells;
 			const pr = u.pr;
-			cells.forEach((ci) => {
-				occ[ci] = -1;
-			});
+			for (let i = 0; i < cells.length; i++) occ[cells[i]] = -1;
 			u.cells = null;
 			u.pr = null;
 			let newSum = 0;
-			const newC = [];
-			aff.forEach((a) => {
-				const c = a === ui ? 0 : engContrib(ctx, occ, units, a);
-				newC.push([a, c]);
-				newSum += c;
-			});
-			return {
-				delta: newSum - oldSum - cells.length * fillW,
-				cells,
-				pr,
-				newC,
-			};
+			const aff = removeRes.aff;
+			aff.n = 0;
+			for (let i = 0; i < adjN; i++) {
+				const a = adjList[i];
+				const cv = engContrib(ctx, occ, units, a, scrB);
+				aff.ids[aff.n] = a;
+				aff.vals[aff.n] = cv;
+				aff.n++;
+				newSum += cv;
+			}
+			// 被移除件自身贡献清零（不计入 newSum），防止残留旧值污染后续 tryPlace 的 oldSum
+			aff.ids[aff.n] = ui;
+			aff.vals[aff.n] = 0;
+			aff.n++;
+			removeRes.delta = newSum - oldSum - cells.length * fillW;
+			removeRes.cells = cells;
+			removeRes.pr = pr;
+			return removeRes;
 		}
 		function applyRemove(res) {
-			res.newC.forEach(([a, c]) => {
-				units[a].contrib = c;
-			});
+			for (let i = 0; i < res.aff.n; i++) {
+				units[res.aff.ids[i]].contrib = res.aff.vals[i];
+			}
 			score += res.delta;
 		}
 		function undoRemove(u, ui, res) {
@@ -1263,40 +1363,43 @@ function engWorkerMain() {
 				const ci = pr.cells[i];
 				if (occ[ci] !== -1 && occ[ci] !== ui) return null;
 			}
-			const aff = engAdjIds(ctx, occ, oldCells, ui);
-			oldCells.forEach((ci) => {
-				occ[ci] = -1;
-			});
-			engAdjIds(ctx, occ, pr.cells, ui).forEach((a) => aff.add(a));
-			aff.add(ui);
-			let oldSum = 0;
-			aff.forEach((a) => {
-				oldSum += units[a].contrib;
-			});
-			pr.cells.forEach((ci) => {
-				occ[ci] = ui;
-			});
+			engAdjBegin(scrA);
+			engAdjCollect(ctx, occ, oldCells, ui, scrA);
+			for (let i = 0; i < oldCells.length; i++) occ[oldCells[i]] = -1;
+			engAdjCollect(ctx, occ, pr.cells, ui, scrA);
+			const adjList = scrA.list;
+			const adjN = adjList.length;
+			let oldSum = u.contrib;
+			for (let i = 0; i < adjN; i++) oldSum += units[adjList[i]].contrib;
+			for (let i = 0; i < pr.cells.length; i++) occ[pr.cells[i]] = ui;
 			u.cells = pr.cells;
 			u.pr = pr;
 			let newSum = 0;
-			const newC = [];
-			aff.forEach((a) => {
-				const c = engContrib(ctx, occ, units, a);
-				newC.push([a, c]);
-				newSum += c;
-			});
-			return {
-				delta: newSum - oldSum,
-				oldCells,
-				newCells: pr.cells,
-				prOld,
-				newC,
-			};
+			const aff = moveRes.aff;
+			aff.n = 0;
+			for (let i = 0; i < adjN; i++) {
+				const a = adjList[i];
+				const cv = engContrib(ctx, occ, units, a, scrB);
+				aff.ids[aff.n] = a;
+				aff.vals[aff.n] = cv;
+				aff.n++;
+				newSum += cv;
+			}
+			const cu = engContrib(ctx, occ, units, ui, scrB);
+			aff.ids[aff.n] = ui;
+			aff.vals[aff.n] = cu;
+			aff.n++;
+			newSum += cu;
+			moveRes.delta = newSum - oldSum;
+			moveRes.oldCells = oldCells;
+			moveRes.newCells = pr.cells;
+			moveRes.prOld = prOld;
+			return moveRes;
 		}
 		function applyMove(res) {
-			res.newC.forEach(([a, c]) => {
-				units[a].contrib = c;
-			});
+			for (let i = 0; i < res.aff.n; i++) {
+				units[res.aff.ids[i]].contrib = res.aff.vals[i];
+			}
 			score += res.delta;
 		}
 		function undoMove(u, ui, res) {
@@ -1385,7 +1488,7 @@ function engWorkerMain() {
 			});
 			let cur = 0;
 			insts.forEach((ins, i) => {
-				ins.contrib = engContrib(ctx, occ2, insts, i);
+				ins.contrib = engContrib(ctx, occ2, insts, i, scrB);
 				cur += ins.contrib;
 			});
 			const freeList = [];
@@ -1408,12 +1511,11 @@ function engWorkerMain() {
 
 			function placeInst2(e, pr) {
 				const id = insts.length;
-				const aff = engAdjIds(ctx, occ2, pr.cells, id);
-				aff.add(id);
+				engAdjInto(ctx, occ2, pr.cells, id, scrA);
+				const adjList = scrA.list;
+				const adjN = adjList.length;
 				let oldSum = 0;
-				aff.forEach((a) => {
-					if (a < insts.length) oldSum += insts[a].contrib;
-				});
+				for (let i = 0; i < adjN; i++) oldSum += insts[adjList[i]].contrib;
 				pr.cells.forEach((ci) => {
 					occ2[ci] = id;
 				});
@@ -1427,22 +1529,25 @@ function engWorkerMain() {
 				}
 				freeCnt -= pr.cells.length;
 				let newSum = 0;
-				aff.forEach((a) => {
-					const c = engContrib(ctx, occ2, insts, a);
-					insts[a].contrib = c;
-					newSum += c;
-				});
+				for (let i = 0; i < adjN; i++) {
+					const a = adjList[i];
+					const cv = engContrib(ctx, occ2, insts, a, scrB);
+					insts[a].contrib = cv;
+					newSum += cv;
+				}
+				const cid = engContrib(ctx, occ2, insts, id, scrB);
+				insts[id].contrib = cid;
+				newSum += cid;
 				cur += newSum - oldSum + pr.cells.length * fillW;
 				added.push({ item: e, r: pr.r, c: pr.c });
 			}
 			function undoInst2(e, pr) {
 				const id = insts.length - 1;
-				const aff = engAdjIds(ctx, occ2, pr.cells, id);
-				aff.add(id);
-				let oldSum = 0;
-				aff.forEach((a) => {
-					oldSum += insts[a].contrib;
-				});
+				engAdjInto(ctx, occ2, pr.cells, id, scrA);
+				const adjList = scrA.list;
+				const adjN = adjList.length;
+				let oldSum = insts[id].contrib;
+				for (let i = 0; i < adjN; i++) oldSum += insts[adjList[i]].contrib;
 				pr.cells.forEach((ci) => {
 					occ2[ci] = -1;
 				});
@@ -1456,12 +1561,12 @@ function engWorkerMain() {
 				}
 				freeCnt += pr.cells.length;
 				let newSum = 0;
-				aff.forEach((a) => {
-					if (a === id) return;
-					const c = engContrib(ctx, occ2, insts, a);
-					insts[a].contrib = c;
-					newSum += c;
-				});
+				for (let i = 0; i < adjN; i++) {
+					const a = adjList[i];
+					const cv = engContrib(ctx, occ2, insts, a, scrB);
+					insts[a].contrib = cv;
+					newSum += cv;
+				}
 				cur += newSum - oldSum - pr.cells.length * fillW;
 				added.pop();
 			}
@@ -1653,16 +1758,46 @@ function engWorkerMain() {
 		}
 
 		// LNS：平台期触发（全局最优 LNS_PERIOD 毫秒未刷新），每周期 1 次摧毁-修复。
-		// 摧毁：50% 随机选 k 件（2~6），50% 选一个连通区域（BFS 扩到 k 件）。
+		// 摧毁：规模 k 自适应（2~10，连续失败扩大）；目标选择三种各 1/3——
+		// 全随机、最差移除（实际贡献/上界 maxC 比最低的若干件中抽，低性价比件优先重排）、
+		// 连通区域（BFS 扩到 k 件）。
 		// 有严格改进则更新最优并采纳为退火新起点；
 		// 无改进时 30% 概率采纳同分替代布局（中性移动，换盆跳出平台期）。
 		function lnsCycle() {
 			const placed = bestLayout.length;
 			if (placed < 2) return;
-			const k = Math.min(2 + ((rand() * 5) | 0), placed);
+			const k = Math.max(
+				2,
+				Math.min(lnsK + (((rand() * 3) | 0) - 1), 10, placed),
+			);
 			const removed = new Set();
-			if (rand() < 0.5) {
+			const roll = rand();
+			if (roll < 1 / 3) {
 				while (removed.size < k) removed.add((rand() * placed) | 0);
+			} else if (roll < 2 / 3) {
+				// 最差移除：重建最优布局占用并逐件算实际贡献，
+				// 从贡献/上界比最低的候选池（至少 4 件、至多一半）中随机抽 k 件
+				const occTmp = new Int16Array(ctx.cellCount).fill(-1);
+				const instsTmp = [];
+				bestLayout.forEach((pl, i) => {
+					const p = items[pl.item];
+					const cells = p.offs.map(
+						([dr, dc]) => (pl.r + dr) * ctx.cols + (pl.c + dc),
+					);
+					cells.forEach((ci) => {
+						occTmp[ci] = i;
+					});
+					instsTmp.push({ item: pl.item, cells });
+				});
+				const ratio = instsTmp.map((ins, i) => ({
+					i,
+					r: engContrib(ctx, occTmp, instsTmp, i, scrB) / maxC[ins.item],
+				}));
+				ratio.sort((a, b) => a.r - b.r);
+				const pool = Math.max(4, Math.min(placed, (placed / 2) | 0));
+				while (removed.size < k) {
+					removed.add(ratio[(rand() * pool) | 0].i);
+				}
 			} else {
 				const occTmp = new Int16Array(ctx.cellCount).fill(-1);
 				const cellsOf = [];
@@ -1695,12 +1830,20 @@ function engWorkerMain() {
 			if (repairFailCache.has(cacheKey)) return;
 			lnsAttempts++;
 			const res = lnsRepair(removed);
-			if (!res || !res.improved) {
+			if (res && res.improved) {
+				lnsK = 2;
+				lnsFailStreak = 0;
+			} else {
 				// 失败缓存：同一 best（同分即同布局）下同一摧毁组合无改进，
 				// 短期内重跑结果相同，跳过；FIFO 封顶，旧失败最终会被重试
 				if (repairFailCache.size >= 500)
 					repairFailCache.delete(repairFailCache.keys().next().value);
 				repairFailCache.add(cacheKey);
+				lnsFailStreak++;
+				if (lnsFailStreak >= 3) {
+					lnsFailStreak = 0;
+					lnsK = Math.min(10, lnsK + 1);
+				}
 			}
 			if (!res) return;
 			if (res.improved) {
@@ -1725,25 +1868,94 @@ function engWorkerMain() {
 			order.forEach((o) => {
 				const pl = placements[o.u.item];
 				if (!pl.length) return;
-				let best = null;
+				// tryPlace 返回共享复用对象，只可取标量：记录最优摆放与增量值，不留存 res 引用
+				let bestPr = null;
+				let bestDelta = 0;
 				for (let k = 0; k < 50; k++) {
 					const pr = pl[(rand() * pl.length) | 0];
 					const res = tryPlace(o.u, o.i, pr);
 					if (res) {
-						if (!best || res.delta > best.res.delta) {
-							best = { pr, res };
+						if (!bestPr || res.delta > bestDelta) {
+							bestPr = pr;
+							bestDelta = res.delta;
 						}
 						undoPlace(o.u, res);
 					}
 				}
-				if (best && best.res.delta > 0) {
-					const r2 = tryPlace(o.u, o.i, best.pr);
+				if (bestPr && bestDelta > 0) {
+					const r2 = tryPlace(o.u, o.i, bestPr);
 					if (r2) applyPlace(o.u, r2);
 				}
 			});
 			bestScore = score;
 			bestLayout = snapshotLayout();
 			lastImproveAt = Date.now();
+		}
+
+		// 局部移动采样：placements 按行主序生成，索引相近 ≈ 位置相近；
+		// 三角分布偏移，跨度取列表长的 1/8（至少 4），兼顾微调与小幅逃离
+		function sampleNear(pl, pi) {
+			const span = Math.max(4, pl.length >> 3);
+			const off = ((rand() + rand() - 1) * span) | 0;
+			let idx = pi + off;
+			if (idx < 0) idx = 0;
+			else if (idx >= pl.length) idx = pl.length - 1;
+			return pl[idx];
+		}
+
+		// 相邻对重摆：选已摆放件 A 的一个相邻件 B，移除两者后各自贪心重摆
+		// （采样 PAIR_SAMPLES 个摆放取增量最大）。拒绝或摆放失败时整体回滚到原位置。
+		// 满盘时单件 move 几乎无处可走，成对重排是突破平台期的主要邻域。
+		const PAIR_SAMPLES = 25;
+		function pairStep(u, ui, T) {
+			engAdjInto(ctx, occ, u.cells, ui, scrA);
+			const adjN = scrA.list.length;
+			if (!adjN) return;
+			const bi = scrA.list[(rand() * adjN) | 0];
+			const v = units[bi];
+			const prA = u.pr;
+			const prB = v.pr;
+			const scoreBefore = score;
+			applyRemove(tryRemove(u, ui));
+			applyRemove(tryRemove(v, bi));
+			const greedyPlace = (uu, uii) => {
+				const pll = placements[uu.item];
+				let bestPr = null;
+				let bestDelta = -Infinity;
+				for (let k = 0; k < PAIR_SAMPLES; k++) {
+					const pr = pll[(rand() * pll.length) | 0];
+					const res = tryPlace(uu, uii, pr);
+					if (res) {
+						if (res.delta > bestDelta) {
+							bestDelta = res.delta;
+							bestPr = pr;
+						}
+						undoPlace(uu, res);
+					}
+				}
+				if (!bestPr) return false;
+				applyPlace(uu, tryPlace(uu, uii, bestPr));
+				return true;
+			};
+			const ok = greedyPlace(u, ui) && greedyPlace(v, bi);
+			if (ok) {
+				const delta = score - scoreBefore;
+				if (delta >= 0 || rand() < Math.exp(delta / T)) {
+					if (score > bestScore + 1e-9) {
+						bestScore = score;
+						bestLayout = snapshotLayout();
+						lastImproveAt = Date.now();
+					}
+					return;
+				}
+			}
+			// 回滚：撤下新位置（若有）后放回原位；空格只会更多，原位必定可放。
+			// score 直接复原，消除 remove/place 多次累加的浮点极差
+			if (u.cells) applyRemove(tryRemove(u, ui));
+			if (v.cells) applyRemove(tryRemove(v, bi));
+			applyPlace(u, tryPlace(u, ui, prA));
+			applyPlace(v, tryPlace(v, bi, prB));
+			score = scoreBefore;
 		}
 
 		function step(T) {
@@ -1755,9 +1967,18 @@ function engWorkerMain() {
 			let res = null;
 			let kind = 0;
 			if (u.cells) {
-				if (rand() < 0.65) {
-					res = tryMove(u, ui, pl[(rand() * pl.length) | 0]);
+				const roll = rand();
+				if (roll < 0.45) {
+					// 移动：半数全随机跳，半数在当前位置附近局部微调
+					const pr =
+						rand() < 0.5
+							? pl[(rand() * pl.length) | 0]
+							: sampleNear(pl, u.pr.pi);
+					res = tryMove(u, ui, pr);
 					kind = 1;
+				} else if (roll < 0.75) {
+					pairStep(u, ui, T);
+					return;
 				} else {
 					res = tryRemove(u, ui);
 					kind = 2;
@@ -1809,6 +2030,23 @@ function engWorkerMain() {
 			);
 			const tStart = Date.now();
 			for (let k = 0; k < 20000; k++) step(T);
+			// 岛模型迁移：主线程广播的全局最优在 chunk 边界采纳为退火新起点。
+			// 节流间隔 ≥ LNS_PERIOD 保护线程多样性；同分不采纳
+			if (pendingAdopt) {
+				const ad = pendingAdopt;
+				pendingAdopt = null;
+				if (
+					ad.score > bestScore + 1e-9 &&
+					Date.now() - lastAdoptAt >= LNS_PERIOD
+				) {
+					lastAdoptAt = Date.now();
+					adoptLayout(ad.layout);
+					bestScore = score;
+					bestLayout = snapshotLayout();
+					lastImproveAt = Date.now();
+					repairFailCache.clear();
+				}
+			}
 			// 混合模式：全局最优 LNS_PERIOD 毫秒未刷新（平台期）才做摧毁-修复
 			if (
 				snap.mode === "lns" &&
@@ -1847,6 +2085,10 @@ const WORKER_SOURCE = [
 	engShapeOffsets.toString(),
 	engPrepare.toString(),
 	engAdjIds.toString(),
+	engAdjScratch.toString(),
+	engAdjBegin.toString(),
+	engAdjCollect.toString(),
+	engAdjInto.toString(),
 	engContrib.toString(),
 	`(${engWorkerMain.toString()})();`,
 ].join("\n");
@@ -1855,6 +2097,7 @@ const WORKER_SOURCE = [
 const engine = {
 	workers: [],
 	stats: {},
+	wbest: {}, // 各线程最近上报的复合分（迁移落后判定用）
 	best: null, // { score, wscore, layout, result }
 	snap: null,
 	mode: "heuristic",
@@ -1863,6 +2106,7 @@ const engine = {
 	startTime: 0,
 	statusTimer: null,
 	limitTimer: null,
+	migrateTimer: null,
 	blobUrl: null,
 };
 
@@ -2345,12 +2589,12 @@ function startCalc() {
 
 	if (snap.mode === "lns") {
 		logLine(
-			`混合最优模式：${workerCount} 个线程独立退火，周期性摧毁-精确修复（LNS），取全局最优`,
+			`混合最优模式：${workerCount} 个线程退火互通最优，周期性摧毁-精确修复（LNS），取全局最优`,
 			"log-sys",
 		);
 	} else {
 		logLine(
-			`快速求解模式：${workerCount} 个线程独立退火，${QUICK_SOLVE_SEC} 秒限时，取全局最优`,
+			`快速求解模式：${workerCount} 个线程退火互通最优，${QUICK_SOLVE_SEC} 秒限时，取全局最优`,
 			"log-sys",
 		);
 	}
@@ -2364,6 +2608,7 @@ function startCalc() {
 	engine.mode = snap.mode;
 	engine.best = null;
 	engine.stats = {};
+	engine.wbest = {};
 	engine.startTime = Date.now();
 	engine.workers = [];
 
@@ -2386,6 +2631,21 @@ function startCalc() {
 	els.layoutLegend.replaceChildren();
 	logStatus("计算中…");
 	engine.statusTimer = setInterval(updateStatusLine, 1000);
+	// 岛模型迁移：每 2s 把全局最优广播给落后 0.1% 以上的线程，
+	// 落后线程采纳为退火新起点（Worker 侧 chunk 边界消费，自带节流）
+	engine.migrateTimer = setInterval(() => {
+		if (!engine.best) return;
+		const g = engine.best;
+		const margin = Math.max(1e-9, g.wscore * 0.001);
+		engine.workers.forEach((wk, w) => {
+			const wb = engine.wbest[w];
+			if (wb != null && wb < g.wscore - margin) {
+				wk.postMessage({ type: "adopt", score: g.wscore, layout: g.layout });
+				const t = ((Date.now() - engine.startTime) / 1000).toFixed(1);
+				logLine(`[${t}s] 线程 ${w + 1} 采纳全局最优`, "log-sys");
+			}
+		});
+	}, 2000);
 	// 耗时上限：到点自动停止并结算（0 表示不限）
 	if (engine.timeLimitSec > 0) {
 		engine.limitTimer = setTimeout(
@@ -2407,6 +2667,8 @@ function stopCalc(reason, statusText) {
 	engine.workers.forEach((w) => w.terminate());
 	engine.workers = [];
 	clearInterval(engine.statusTimer);
+	clearInterval(engine.migrateTimer);
+	engine.migrateTimer = null;
 	clearTimeout(engine.limitTimer);
 	engine.limitTimer = null;
 	setCalcRunning(false);
@@ -2461,6 +2723,7 @@ function onWorkerMessage(e) {
 	if (m.type === "best") {
 		// m.score 是 Worker 内部复合分（属性分 + 占格数 × fillW，两种模式含义不同），
 		// 只用于线程间比较；展示与存档的分数由主线程 engScoreLayout 重算，始终是归一化属性分
+		engine.wbest[m.wid] = m.score;
 		if (!engine.best || m.score > engine.best.wscore + 1e-9) {
 			const result = engScoreLayout(engine.snap, m.layout);
 			engine.best = {

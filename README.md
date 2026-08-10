@@ -2,11 +2,6 @@
 
 纯网页端法宝背包布局求解工具：选好法宝、棋盘与权重后多线程搜索得分最高的摆放方案，支持截图识别导入弟子棋盘。无构建、无外部依赖，浏览器直接打开 `index.html` 即可使用。
 
-## 界面说明
-
-- 实时布局中的同一法宝连续显示，内部不绘制分隔格线；不同法宝之间使用白色分隔线。
-- 法宝列表和已选列表上方提供“显示列”控制，可分别展开基础属性、加成和添加数量，默认收起以保持表格紧凑。
-
 ## 数据产出流程
 
 `index.html` 依赖的数据全部由 `tools/` 下工具产出到 `data/`（**请勿手改**），用 `<script src>` 引入：
@@ -85,6 +80,7 @@ node tools/文本图鉴转对象工具.js  # 读取 shapes.json，生成 BLOCKS
 - `node tools/bench/bench.js compare`：对照基线报告逐项回归对比（下降标红）
 - `node tools/bench/bench.js calib-dots`：SCAN_DOT_TYPES 区间校准（圆盘全像素采样 + hue 分水岭簇分析，产出两两零重叠建议区间；经交叠硬校验后 `--yes` 段级写回，交叠即拒绝）
 - `node tools/bench/refingerprint.js`：批量重提全库指纹并收紧组 maxDiff
+- `node tools/bench/solve-bench.js`：求解引擎无头回归（worker_threads 直跑 main.index.js 引擎段，多 seed 对比最优分分布）；`--src HEAD` 跑改动前基线，改动求解算法后用它出前后对比数据
 - **模型重训**（SCAN_DOT_TYPES 区间变更入库后必做）：
   ```bash
   node tools/bench/dump-feats.js && node tools/bench/bench.js calib-types && \
