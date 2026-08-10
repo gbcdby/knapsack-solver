@@ -4009,7 +4009,9 @@ function scanSetImage(bitmap) {
 
 function scanLoadFile(file) {
 	if (!file || !file.type.startsWith("image/")) return;
-	createImageBitmap(file).then(scanSetImage, () => {
+	// colorSpaceConversion:"none"：禁用 ICC 转换取原值，与 node bench 校准口径对齐
+	// （P3 截图转 sRGB 会偏移饱和色 hue，水11 事故，详见 fp-worker.js fpwDecode 注释）
+	createImageBitmap(file, { colorSpaceConversion: "none" }).then(scanSetImage, () => {
 		scanStatus("图片读取失败", "err");
 	});
 }
