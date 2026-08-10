@@ -89,8 +89,10 @@
  *   2026-08-05 集成，像素级小模型计划阶段 2，仅 T2 全量 dot 验证）：
  *   - 用途：规则链（规范位彩色/强票补救/体路径/邻域闸门）判 dot=true 的格
  *     过像素 MLP 验证器（16²×3 HSV 降采样 + 1 隐层 tanh + softmax 二分类
- *     real/fake），vScore = log p(real) - log p(fake) < gate.vScoreTh 则
- *     直接否决 dot（dot=false/dotType=null，原判定留 pixelVeto 调试字段）。
+ *     real/fake），vScore = log p(real) - log p(fake) 低于阈值则直接否决
+ *     dot（dot=false/dotType=null，原判定留 pixelVeto 调试字段）；阈值按
+ *     dotType 取 gate.vScoreThByType（分类型出折 min 校准 + 在样收紧，缺失
+ *     类型回退 gate.vScoreTh，校准依据见模型段头注释）。
  *     杀规则链内的假 dot（土系碎裂件内假锚点、规范位纹理伪命中）后，
  *     scanGenCandidates 的冲突否决自然消解，被拖死的真锚点救回。
  *   - 作用域限制：模型兜底（SCAN_TYPE_MODEL）判中的格不过验证器——训练
@@ -656,7 +658,12 @@ function scanDiskJudge(disk, ranges) {
 		(mx, [t, n]) => (t === dotType ? mx : Math.max(mx, n)),
 		0,
 	);
-	if (rival > SCAN_REC.dotDiskRivalMax) return null;
+	// 分类型异型票上限与判定链 diskOk 同口径（邪走 dotXieDiskRivalMax，缺失回退全局）
+	const rivalMax =
+		dotType === "邪" && SCAN_REC.dotXieDiskRivalMax != null
+			? SCAN_REC.dotXieDiskRivalMax
+			: SCAN_REC.dotDiskRivalMax;
+	if (rival > rivalMax) return null;
 	if (disk.glyphFrac < SCAN_REC.dotDiskGlyphMin) return null;
 	return dotType;
 }
@@ -820,7 +827,14 @@ function scanCellFeat(data, dotTypes, skipModel) {
 			(mx, [ty, m]) => (ty === t ? mx : Math.max(mx, m)),
 			0,
 		);
-		if (rival > SCAN_REC.dotDiskRivalMax) return false;
+		// 邪走分类型上限 dotXieDiskRivalMax（校准依据见 data/scan-fp-refs.js 该键注释）；
+		// 键缺失（旧数据文件）时回退全局值——与 SCAN_REC 整段缺失 throw 不同，单键缺
+		// 失属增量部署场景，回退不产生错误结果
+		const rivalMax =
+			t === "邪" && SCAN_REC.dotXieDiskRivalMax != null
+				? SCAN_REC.dotXieDiskRivalMax
+				: SCAN_REC.dotDiskRivalMax;
+		if (rival > rivalMax) return false;
 		return dk.glyphFrac >= SCAN_REC.dotDiskGlyphMin;
 	};
 	const judgeDisk = (t, f, dk, bgMin, hitMin) =>
@@ -1256,7 +1270,15 @@ function scanCellFeat(data, dotTypes, skipModel) {
 		const pm = window.SCAN_PIXEL_MODEL;
 		const pv = scanPixelMlpScore(pm, scanPixelMlpFeats(data));
 		const vScore = Math.log(pv.probs.real + 1e-12) - Math.log(pv.probs.fake + 1e-12);
-		if (vScore < pm.gate.vScoreTh) {
+		// 分类型阈值（calib-pixel 按规则链 dotType 分组的出折真锚点 min 校准，依据
+		// 见模型段头注释）：全局阈值被最差类型（邪，暗徽标泛化落差大）拖低时其余
+		// 类型仍保杀假能力；vScoreThByType 缺失或未覆盖该类型时回退全局阈值
+		const thByType =
+			pm.gate.vScoreThByType && dotType !== null
+				? pm.gate.vScoreThByType[dotType]
+				: undefined;
+		const vScoreTh = thByType === undefined ? pm.gate.vScoreTh : thByType;
+		if (vScore < vScoreTh) {
 			pixelVeto = { dotType, vScore: +vScore.toFixed(4) };
 			dot = false;
 			dotType = null;
