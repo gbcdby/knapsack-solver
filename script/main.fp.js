@@ -3920,6 +3920,7 @@ const DOT_TYPE_COLORS = {
 	火: "#e03c31",
 	土: "#b87514",
 	雷: "#8b5cf6",
+	邪: "#c2185b",
 	体: "#6b7280",
 };
 const dotColor = (t) => DOT_TYPE_COLORS[t] || "#9aa0a6";
