@@ -809,7 +809,7 @@ async function cmdCalibPixel() {
 		hidden: SCAN_PIXEL_ARCH.hidden,
 		activation: SCAN_PIXEL_ARCH.activation,
 		classes: SCAN_PIXEL_CLASSES,
-		epochs: +(process.env.PIXEL_EPOCHS || 300), // 容量校准（2026-08-10）：30/120/300 对照——出折杀假 107/107/111、在样杀假 96/114/115、误伤均 0/1528，300 两轴皆优且出折零误伤保持；环境变量供后续实验
+		epochs: +(process.env.PIXEL_EPOCHS || 600), // 容量校准（2026-08-10）：30/120/300/600 对照——在样杀假 96/114/115/116、出折杀假 107/107/111/112、误伤均 0/1528；600 两轴皆优（多杀的土13(4,5) 假水锚点贴 300 阈值存活），环境变量供后续实验
 		seed: 20260804,
 	};
 
